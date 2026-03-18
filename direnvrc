@@ -1,0 +1,37 @@
+# 1Password helpers for direnv.
+#
+# op_auth [ref]  — set OP_SERVICE_ACCOUNT_TOKEN (cached, biometric once per session)
+# op_inject src  — eval secrets via SA token (no cache, no secrets on disk)
+# op_inject src VAR dest — write resolved file, export VAR=dest
+#
+# Setup:
+#   cp direnvrc ~/.config/direnv/direnvrc
+#
+# NOTE: _OP_DEFAULT_SA points to a 1Password item that stores
+#       your Service Account token. Change this to your own path.
+
+_OP_DEFAULT_SA="op://Private/1pass-service-accounts/src-envs-shell"
+
+op_auth() {
+  local ref="${1:-$_OP_DEFAULT_SA}"
+  local cache="$TMPDIR/.op-sa-$(echo "$ref" | md5 -q /dev/stdin)"
+  if [[ ! -s "$cache" ]]; then
+    op read "$ref" > "$cache" || { rm -f "$cache"; log_error "op_auth: failed to read SA token"; return 1; }
+  fi
+  export OP_SERVICE_ACCOUNT_TOKEN="$(cat "$cache")"
+}
+
+op_inject() {
+  local src="$1"
+  # Auto-authenticate with default SA if not already set
+  [[ -z "$OP_SERVICE_ACCOUNT_TOKEN" ]] && op_auth
+
+  if [[ $# -ge 3 ]]; then
+    op inject --in-file "$src" > "$3"
+    export "$2"="$3"
+  else
+    eval "$(op inject --in-file "$src")"
+  fi
+
+  watch_file "$src"
+}
