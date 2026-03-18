@@ -1,4 +1,4 @@
-# workstation-secrets
+# op-direnv
 
 Секреты из 1Password в shell без повторных запросов авторизации.
 
@@ -69,6 +69,32 @@ op_inject .kube/config KUBECONFIG "$TMPDIR/kubeconfig-myproject"
 ```
 
 Не забудьте `direnv allow` и добавить `.env.op` в `.gitignore` если vault/item пути приватные.
+
+### Без direnv (только `.zshrc`)
+
+Добавьте в `~/.zshrc`:
+
+```bash
+# 1Password: SA token (биометрия один раз, кэш до ребута)
+_OP_SA_REF="op://Private/1pass-service-accounts/src-envs-shell"
+_OP_SA_CACHE="$TMPDIR/.op-sa-$(echo "$_OP_SA_REF" | md5 -q /dev/stdin)"
+
+if [[ ! -s "$_OP_SA_CACHE" ]]; then
+  op read "$_OP_SA_REF" > "$_OP_SA_CACHE" || rm -f "$_OP_SA_CACHE"
+fi
+[[ -s "$_OP_SA_CACHE" ]] && export OP_SERVICE_ACCOUNT_TOKEN="$(cat "$_OP_SA_CACHE")"
+
+# Секреты (резолвятся при старте шелла)
+eval "$(op inject --in-file ~/.env.op)"
+```
+
+Создайте `~/.env.op`:
+
+```bash
+export GITHUB_TOKEN="op://VaultName/item-name/field"
+```
+
+При открытии первого терминала — Touch ID один раз. Все последующие терминалы подхватят кэшированный SA token без промптов.
 
 ## Как это работает
 
