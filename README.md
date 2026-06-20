@@ -14,13 +14,24 @@
 
 ## Решение
 
-Двухуровневая схема с Service Account (SA) token:
+Двухуровневая схема с Service Account (SA) token: токен читается один раз по Touch ID и кэшируется, дальше `op inject` работает без промптов.
 
-```
-Touch ID (один раз)
-  └─► op read — получает SA token из 1Password
-        └─► кэш в $TMPDIR (живёт до ребута)
-              └─► op inject использует SA token — без промптов
+```mermaid
+flowchart TD
+    cd(["cd в проект → direnv"]) --> A["op_inject .env.op<br/>(дефолтный SA)"]
+    cd --> B["op_inject .env.other.op --sa REF<br/>(второй аккаунт)"]
+    A --> qA{"токен в<br/>$TMPDIR?"}
+    B --> qB{"токен REF в<br/>$TMPDIR?"}
+    qA -- "нет" --> tA["op read → Touch ID<br/>(env -u, биометрия)"]
+    qB -- "нет" --> tB["op read → Touch ID"]
+    tA --> cA["кэш $TMPDIR/.op-sa-*"]
+    tB --> cB["кэш $TMPDIR/.op-sa-*"]
+    qA -- "да" --> cA
+    qB -- "да" --> cB
+    cA --> iA["op inject под дефолтным SA"]
+    cB --> iB["op inject под SA₂<br/>(токен в шелл НЕ течёт)"]
+    iA --> env["export-переменные в окружении<br/>(оба набора рядом)"]
+    iB --> env
 ```
 
 1. Первый `cd` в проект → direnv вызывает `op_inject` → нужен SA token
@@ -54,6 +65,16 @@ op-direnv exec   REF -- CMD…         → запускает CMD под SA-то
 ```
 
 `direnvrc` — лишь тонкие обёртки (`op_auth`, `op_inject`), чтобы `.envrc` читался коротко. Почему обёртки, а не «всё в скрипте»: дочерний процесс не может выставить переменную родителю, поэтому `export` обязан произойти в контексте, который исполняет `.envrc` (`eval "$(op-direnv inject …)"`).
+
+Слои вызова (имена похожи, но это три разных уровня):
+
+```mermaid
+flowchart LR
+    envrc[".envrc"] --> fn["op_inject<br/>функция (direnvrc)"]
+    fn -->|"eval $(…)"| script["op-direnv<br/>скрипт (~/bin, на PATH)"]
+    script --> opcli["op<br/>1Password CLI"]
+    opcli --> opw[("1Password")]
+```
 
 ## Установка
 
