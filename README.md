@@ -42,13 +42,30 @@ Touch ID (один раз)
 2. Дать доступ к vault'ам, из которых будут читаться секреты
 3. Сохранить SA token как item в 1Password (например `op://Private/1pass-service-accounts/src-envs-shell`)
 
+## Архитектура
+
+Вся логика — в одном скрипте **`op-direnv`** (bash, кладётся в `$PATH`). Он шелл-независим и вызывается одинаково из direnv, из любого шелла, из CI:
+
+```
+op-direnv auth   [REF]               → печатает export OP_SERVICE_ACCOUNT_TOKEN=… (ambient-токен)
+op-direnv inject FILE [--sa REF]     → печатает резолвнутые export-строки из FILE
+op-direnv render SRC DEST [--sa REF] → пишет резолвнутый файл в DEST (kubeconfig и т.п.)
+op-direnv exec   REF -- CMD…         → запускает CMD под SA-токеном REF (любой шелл)
+```
+
+`direnvrc` — лишь тонкие обёртки (`op_auth`, `op_inject`), чтобы `.envrc` читался коротко. Почему обёртки, а не «всё в скрипте»: дочерний процесс не может выставить переменную родителю, поэтому `export` обязан произойти в контексте, который исполняет `.envrc` (`eval "$(op-direnv inject …)"`).
+
 ## Установка
 
 ```bash
-# Скопировать direnv helpers
+# 1. Скрипт на PATH
+cp op-direnv ~/bin/op-direnv && chmod +x ~/bin/op-direnv   # или symlink
+
+# 2. direnv-обёртки
 cp direnvrc ~/.config/direnv/direnvrc
 
-# Отредактировать _OP_DEFAULT_SA — путь к вашему SA token в 1Password
+# 3. Указать свой дефолтный SA (если путь отличается от дефолта в скрипте)
+echo 'export OP_DIRENV_DEFAULT_SA="op://Private/1pass-service-accounts/your-sa"' >> ~/.zshrc
 ```
 
 ## Использование
@@ -76,22 +93,13 @@ op_inject .kube/config KUBECONFIG "$TMPDIR/kubeconfig-myproject"
 
 Не забудьте `direnv allow` и добавить `.env.op` в `.gitignore` если vault/item пути приватные.
 
-### Без direnv (только `.zshrc`)
+### Без direnv (только `.zshrc`/`.bashrc`)
 
-Добавьте в `~/.zshrc`:
+Тот же скрипт, без direnv-обёрток. Добавьте в свой shell-профиль:
 
 ```bash
-# 1Password: SA token (биометрия один раз, кэш до ребута)
-_OP_SA_REF="op://Private/1pass-service-accounts/src-envs-shell"
-_OP_SA_CACHE="$TMPDIR/.op-sa-$(echo "$_OP_SA_REF" | md5 -q /dev/stdin)"
-
-if [[ ! -s "$_OP_SA_CACHE" ]]; then
-  op read "$_OP_SA_REF" > "$_OP_SA_CACHE" || rm -f "$_OP_SA_CACHE"
-fi
-[[ -s "$_OP_SA_CACHE" ]] && export OP_SERVICE_ACCOUNT_TOKEN="$(cat "$_OP_SA_CACHE")"
-
-# Секреты (резолвятся при старте шелла)
-eval "$(op inject --in-file ~/.env.op)"
+eval "$(op-direnv auth)"                 # ambient SA-токен, Touch ID один раз
+eval "$(op-direnv inject ~/.env.op)"     # секреты резолвятся при старте шелла
 ```
 
 Создайте `~/.env.op`:
@@ -102,22 +110,92 @@ export GITHUB_TOKEN="op://VaultName/item-name/field"
 
 При открытии первого терминала — Touch ID один раз. Все последующие терминалы подхватят кэшированный SA token без промптов.
 
+## Подводные камни
+
+Три ловушки, на которых легко застрять. Если что-то «не работает» — почти всегда одна из них.
+
+### 1. Забыли `export` — переменной нет в окружении
+
+```bash
+GITHUB_TOKEN="op://Vault/item/field"          # ❌ переменная появляется и тут же пропадает
+export GITHUB_TOKEN="op://Vault/item/field"   # ✅
+```
+
+`op_inject` делает `eval` строк файла. `VAR=value` создаёт **локальную** переменную шелла; direnv переносит в твой шелл только **экспортированные**. Без `export` секрет резолвится молча, но в `env` его не будет. Симптом: `env | grep VAR` пусто, ошибок нет.
+
+### 2. `op inject` сканирует `op://` даже в КОММЕНТАРИЯХ
+
+`op inject` — это текстовая подстановка по всему файлу, ему всё равно, что строка закомментирована для шелла.
+
+```bash
+# пример: op://Vault/item/field   ← ❌ direnv упадёт: invalid secret reference
+```
+
+- Невалидная `op://`-ссылка в комментарии → `[ERROR] invalid secret reference` при `direnv allow`.
+- Даже `op://.` из обычного предложения в комментарии будет распознано как ссылка.
+- Валидная закомментированная ссылка молча резолвится впустую (лишний запрос).
+
+**Правило:** в `.env.op` не пиши `op://` в комментариях вообще — реальная ссылка только в живой `export`-строке.
+
+### 3. Service Account не читает чужой biometric-vault
+
+SA-токен имеет доступ только к выданным ему vault'ам. Сам токен лежит в `Private` (biometric-only), куда SA доступа НЕ имеет. Поэтому `op_auth` читает токен через `env -u OP_SERVICE_ACCOUNT_TOKEN` — то есть сняв активный токен, чтобы сработала биометрия. Если убрать `env -u`, переключение на второй аккаунт упадёт.
+
+## Несколько аккаунтов
+
+Один SA-токен = один 1Password-аккаунт; один вызов `op` = один токен. Но в одном `.envrc` можно подтянуть секреты из **двух** аккаунтов: резолвим первый файл под токеном A, второй — под токеном B. Оба набора окажутся в окружении одновременно.
+
+1. Создай Service Account во **втором** аккаунте, дай доступ к нужному vault.
+2. Сохрани его токен как item в своём личном `Private` (например `op://Private/1pass-service-accounts/other-account`).
+3. В `.envrc` — тот же `op_inject`, с флагом `--sa`:
+
+```bash
+op_inject .env.op                                                     # первый аккаунт (дефолтный SA)
+op_inject .env.other.op --sa "op://Private/1pass-service-accounts/other-account"   # второй аккаунт
+```
+
+С `--sa` аутентификация происходит внутри дочернего процесса `op-direnv` — токен второго аккаунта **не попадает** в твой шелл, и ручной `op` продолжает работать с первым аккаунтом.
+
+### Ручной `op` против второго аккаунта
+
+`op-direnv exec` работает в любом шелле:
+
+```bash
+op-direnv exec "op://Private/1pass-service-accounts/other-account" -- op item list --vault OtherVault
+```
+
+Для краткости — алиас в своём профиле (опционально):
+
+```bash
+alias op2='op-direnv exec op://Private/1pass-service-accounts/other-account -- op'
+# op2 item list --vault OtherVault
+```
+
+Кэш токена общий с direnv → Touch ID максимум один раз за сессию.
+
 ## Как это работает
 
-### `op_auth [ref]`
+Логика — в скрипте `op-direnv` (см. `op-direnv --help`). `direnvrc` — обёртки над ним.
 
-Получает SA token через `op read` (требует авторизации в личном аккаунте), кэширует в `$TMPDIR`. При повторном вызове читает из кэша.
+### `op_auth [ref]` (обёртка над `op-direnv auth`)
 
-### `op_inject src`
+Получает SA token через `op read` (биометрия), кэширует в `$TMPDIR/.op-sa-*`, выставляет ambient `OP_SERVICE_ACCOUNT_TOKEN`. При повторном вызове — из кэша.
 
-Вызывает `op inject --in-file` с автоматической авторизацией через SA token. Два режима:
-- `op_inject .env.op` — резолвит `op://` ссылки и экспортирует переменные
-- `op_inject .kube/config KUBECONFIG /tmp/kube` — резолвит файл, записывает результат, экспортирует переменную
+### `op_inject src [--sa ref]` (обёртка над `op-direnv inject`/`render`)
+
+- `op_inject .env.op` — резолвит `op://` ссылки и экспортирует переменные (дефолтный SA).
+- `op_inject .env.op --sa "op://…/other"` — то же, но под указанным SA (второй аккаунт); токен в шелл не течёт.
+- `op_inject .kube/config KUBECONFIG /tmp/kube` — резолвит файл, пишет на диск, экспортирует переменную (тоже принимает `--sa`).
+
+### Токен читается со снятым `OP_SERVICE_ACCOUNT_TOKEN`
+
+`op-direnv` всегда делает `env -u OP_SERVICE_ACCOUNT_TOKEN op read REF` — токен-item лежит в biometric-vault (Private), куда сам SA доступа не имеет. Без этого переключение на второй аккаунт падает (см. [Подводные камни №3](#3-service-account-не-читает-чужой-biometric-vault)).
 
 ## Файлы
 
 | Файл | Назначение |
 |------|-----------|
-| `direnvrc` | Функции `op_auth` и `op_inject` → `~/.config/direnv/direnvrc` |
+| `op-direnv` | Скрипт со всей логикой → `~/bin/op-direnv` (на PATH) |
+| `direnvrc` | Обёртки `op_auth`/`op_inject` → `~/.config/direnv/direnvrc` |
 | `example.envrc` | Пример `.envrc` для проекта |
 | `example.env.op` | Пример `.env.op` со ссылками на секреты |

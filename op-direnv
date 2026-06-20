@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# op-direnv — 1Password Service Account helper for direnv and manual use.
+#
+#   op-direnv auth   [REF]                 print `export OP_SERVICE_ACCOUNT_TOKEN=…` (ambient token)
+#   op-direnv inject FILE [--sa REF]       print resolved `export …` lines from FILE
+#   op-direnv render SRC DEST [--sa REF]   write resolved SRC to DEST (e.g. kubeconfig)
+#   op-direnv exec   REF -- CMD…           run CMD with the SA token of REF (any shell)
+#
+# REF is an op:// reference to a 1Password item holding a Service Account token,
+# stored in a vault you can unlock interactively (e.g. Private). The token is read
+# with biometric (op desktop integration), cached in $TMPDIR, reused without prompts.
+#
+# Default SA: $OP_DIRENV_DEFAULT_SA, else the constant below — override in your shell.
+set -euo pipefail
+
+DEFAULT_SA="${OP_DIRENV_DEFAULT_SA:-op://Private/1pass-service-accounts/src-envs-shell}"
+
+_hash() {  # stable hash of stdin; macOS `md5`, Linux `md5sum`
+  if command -v md5 >/dev/null 2>&1; then md5 -q /dev/stdin
+  else md5sum | cut -d' ' -f1; fi
+}
+
+_cache_path() {  # same scheme as the legacy direnvrc (echo adds a newline) → shared cache
+  printf '%s/.op-sa-%s' "${TMPDIR:-/tmp}" "$(printf '%s\n' "$1" | _hash)"
+}
+
+_ensure_token() {  # echo the SA token for REF, reading+caching on first use
+  local ref="$1" cache
+  cache="$(_cache_path "$ref")"
+  if [[ ! -s "$cache" ]]; then
+    # env -u: read WITHOUT an active SA token — the token item lives in a
+    # biometric vault a service account cannot read.
+    ( umask 077; env -u OP_SERVICE_ACCOUNT_TOKEN op read "$ref" >"$cache" ) \
+      || { rm -f "$cache"; echo "op-direnv: cannot read SA token: $ref" >&2; return 1; }
+  fi
+  cat "$cache"
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  auth)
+    ref="${1:-$DEFAULT_SA}"
+    printf 'export OP_SERVICE_ACCOUNT_TOKEN=%q\n' "$(_ensure_token "$ref")"
+    ;;
+
+  inject)
+    file="" sa=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --sa) sa="${2:?--sa needs a REF}"; shift 2 ;;
+        *)    file="$1"; shift ;;
+      esac
+    done
+    [[ -n "$file" ]] || { echo "usage: op-direnv inject FILE [--sa REF]" >&2; exit 2; }
+    if [[ -n "$sa" ]]; then
+      OP_SERVICE_ACCOUNT_TOKEN="$(_ensure_token "$sa")" op inject --in-file "$file"
+    elif [[ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]]; then
+      op inject --in-file "$file"
+    else
+      OP_SERVICE_ACCOUNT_TOKEN="$(_ensure_token "$DEFAULT_SA")" op inject --in-file "$file"
+    fi
+    ;;
+
+  render)
+    src="" dest="" sa=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --sa) sa="${2:?--sa needs a REF}"; shift 2 ;;
+        *)    if [[ -z "$src" ]]; then src="$1"; else dest="$1"; fi; shift ;;
+      esac
+    done
+    [[ -n "$src" && -n "$dest" ]] || { echo "usage: op-direnv render SRC DEST [--sa REF]" >&2; exit 2; }
+    ( umask 077
+      OP_SERVICE_ACCOUNT_TOKEN="$(_ensure_token "${sa:-$DEFAULT_SA}")" op inject --in-file "$src" >"$dest" )
+    ;;
+
+  exec)
+    ref="${1:?usage: op-direnv exec REF -- CMD...}"; shift
+    [[ "${1:-}" == "--" ]] && shift
+    [[ $# -gt 0 ]] || { echo "usage: op-direnv exec REF -- CMD..." >&2; exit 2; }
+    OP_SERVICE_ACCOUNT_TOKEN="$(_ensure_token "$ref")" exec "$@"
+    ;;
+
+  ""|-h|--help|help)
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+
+  *) echo "op-direnv: unknown command '$cmd' (try: auth, inject, render, exec)" >&2; exit 2 ;;
+esac
