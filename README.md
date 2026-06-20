@@ -76,6 +76,31 @@ flowchart LR
     opcli --> opw[("1Password")]
 ```
 
+Порядок вызовов от старта шелла (кто кого зовёт и какой конфиг читается на каждом шаге):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as Шелл (zsh)
+    participant D as direnv
+    participant S as op-direnv (скрипт)
+    participant OP as op + 1Password
+
+    Note over U: старт шелла
+    U->>U: ~/.zshrc → eval "$(direnv hook zsh)"
+    Note over U: cd в проект
+    U->>D: hook срабатывает (найден .envrc)
+    D->>D: читает ~/.config/direnv/direnvrc<br/>(ДО каждого .envrc — определяет op_auth/op_inject)
+    D->>D: читает <project>/.envrc<br/>(вызывает op_inject .env.op [--sa REF])
+    D->>S: op_inject (функция) → op-direnv inject FILE [--sa REF]
+    S->>OP: op read (токен, Touch ID 1×, кэш) + op inject
+    OP-->>S: резолвнутые export-строки
+    S-->>D: export VAR=…
+    D-->>U: переменные в окружении шелла
+```
+
+Ключевое: `~/.zshrc` лишь **регистрирует hook** (один раз при старте). Сам hook на каждом `cd` запускает direnv, а уже direnv читает сначала `direnvrc` (общий), потом `.envrc` (проектный) — в одном bash-контексте.
+
 ## Установка
 
 ```bash
