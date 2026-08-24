@@ -18,20 +18,20 @@
 
 ```mermaid
 flowchart TD
-    cd(["cd в проект → direnv"]) --> A["op_inject .env.op<br/>(дефолтный SA)"]
-    cd --> B["op_inject .env.other.op --sa REF<br/>(второй аккаунт)"]
-    A --> qA{"токен в<br/>$TMPDIR?"}
-    B --> qB{"токен REF в<br/>$TMPDIR?"}
-    qA -- "нет" --> tA["op read → Touch ID<br/>(env -u, биометрия)"]
-    qB -- "нет" --> tB["op read → Touch ID"]
-    tA --> cA["кэш $TMPDIR/.op-sa-*"]
-    tB --> cB["кэш $TMPDIR/.op-sa-*"]
-    qA -- "да" --> cA
-    qB -- "да" --> cB
-    cA --> iA["op inject под дефолтным SA"]
-    cB --> iB["op inject под SA₂<br/>(токен в шелл НЕ течёт)"]
-    iA --> env["export-переменные в окружении<br/>(оба набора рядом)"]
-    iB --> env
+    cd(["cd в проект → direnv"]) --> unlock{"keychain кэша<br/>разблокирован?<br/>(SecKeychainGetStatus)"}
+    unlock -- "заперт" --> pw["op read пароля из Private<br/>→ Touch ID по политике 1Password<br/>→ unlock-keychain"]
+    unlock -- "да" --> refs
+    pw --> refs["собрать op://-ссылки<br/>из .env.op и .kube/config"]
+    refs --> hit{"каждая ссылка<br/>есть в кэше?"}
+    hit -- "все есть" --> subst["подстановка значений<br/>~0.1 с, сети нет"]
+    hit -- "есть промахи" --> tok{"SA-токен<br/>в $TMPDIR?"}
+    tok -- "нет" --> tA["op read → Touch ID<br/>(env -u, биометрия)"]
+    tA --> cA["кэш токена $TMPDIR/.op-sa-*"]
+    tok -- "да" --> cA
+    cA --> inj["ВСЕ промахи одним op inject<br/>~0.7 с независимо от их числа"]
+    inj --> put["каждое значение → keychain<br/>(security -i, мимо argv)"]
+    put --> subst
+    subst --> env["export-переменные в окружении<br/>+ kubeconfig файлом на диск"]
 ```
 
 1. Первый `cd` в проект → direnv вызывает `op_inject` → нужен SA token
@@ -76,9 +76,10 @@ op-direnv flush  [FILE | op://REF …] → сбросить кэш: весь, и
 
 ```mermaid
 flowchart LR
-    envrc[".envrc"] --> fn["op_inject<br/>функция (direnvrc)"]
-    fn -->|"eval $(…)"| script["op-direnv<br/>скрипт (~/bin, на PATH)"]
-    script --> opcli["op<br/>1Password CLI"]
+    envrc[".envrc"] --> fn["op_inject / op_multi<br/>функция (direnvrc)"]
+    fn -->|"eval $(…)"| script["op-direnv<br/>python3, ~/bin, на PATH"]
+    script --> kc[("op-direnv.keychain<br/>кэш значений")]
+    script -->|"только при промахе"| opcli["op<br/>1Password CLI"]
     opcli --> opw[("1Password")]
 ```
 
@@ -89,19 +90,32 @@ sequenceDiagram
     autonumber
     participant U as Шелл (zsh)
     participant D as direnv
-    participant S as op-direnv (скрипт)
+    participant S as op-direnv (python)
+    participant K as Keychain (кэш)
     participant OP as op + 1Password
 
     Note over U: старт шелла
     U->>U: ~/.zshrc → eval "$(direnv hook zsh)"
     Note over U: cd в проект
     U->>D: hook срабатывает (найден .envrc)
-    D->>D: читает ~/.config/direnv/direnvrc<br/>(ДО каждого .envrc — определяет op_auth/op_inject)
-    D->>D: читает <project>/.envrc<br/>(вызывает op_inject .env.op [--sa REF])
-    D->>S: op_inject (функция) → op-direnv inject FILE [--sa REF]
-    S->>OP: op read (токен, Touch ID 1×, кэш) + op inject
-    OP-->>S: резолвнутые export-строки
-    S-->>D: export VAR=…
+    D->>D: читает ~/.config/direnv/direnvrc<br/>(ДО каждого .envrc — определяет op_inject/op_multi)
+    D->>D: читает <project>/.envrc<br/>(вызывает op_multi .env.op --file …)
+    D->>S: функция-обёртка → op-direnv multi …
+    S->>K: разблокирован? (Security.framework, без диалога)
+    K-->>S: да / заперт
+    opt keychain заперт (раз в 12 ч)
+        S->>OP: op read пароля из Private → Touch ID
+        S->>K: unlock-keychain
+    end
+    S->>K: значения по op://-ссылкам (параллельно)
+    alt все ссылки в кэше — обычный случай, ~0.1 с
+        K-->>S: значения
+    else есть промахи
+        S->>OP: op inject всех промахов одним вызовом (~0.7 с)
+        OP-->>S: значения
+        S->>K: сохранить каждое
+    end
+    S-->>D: export VAR=… (+ kubeconfig на диск)
     D-->>U: переменные в окружении шелла
 ```
 
