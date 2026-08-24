@@ -1,89 +1,416 @@
-#!/usr/bin/env bash
-# op-direnv — 1Password Service Account helper for direnv and manual use.
-#
-#   op-direnv auth   [REF]                 print `export OP_SERVICE_ACCOUNT_TOKEN=…` (ambient token)
-#   op-direnv inject FILE [--sa REF]       print resolved `export …` lines from FILE
-#   op-direnv render SRC DEST [--sa REF]   write resolved SRC to DEST (e.g. kubeconfig)
-#   op-direnv exec   REF -- CMD…           run CMD with the SA token of REF (any shell)
-#
-# REF is an op:// reference to a 1Password item holding a Service Account token,
-# stored in a vault you can unlock interactively (e.g. Private). The token is read
-# with biometric (op desktop integration), cached in $TMPDIR, reused without prompts.
-#
-# Default SA: $OP_DIRENV_DEFAULT_SA, else the constant below — override in your shell.
-set -euo pipefail
+#!/usr/bin/env python3
+"""op-direnv — 1Password Service Account helper for direnv and manual use.
 
-DEFAULT_SA="${OP_DIRENV_DEFAULT_SA:-op://Private/1pass-service-accounts/src-envs-shell}"
+  op-direnv auth   [REF]                 print `export OP_SERVICE_ACCOUNT_TOKEN=…`
+  op-direnv inject FILE [--sa REF]       print resolved `export …` lines from FILE
+  op-direnv render SRC DEST [--sa REF]   write resolved SRC to DEST (e.g. kubeconfig)
+  op-direnv multi  [ENVFILE] [--file SRC VAR DEST]…   one op call for several files
+  op-direnv exec   REF -- CMD…           run CMD with the SA token of REF
+  op-direnv cache                        list cached secrets with their creation date
+  op-direnv flush  [FILE | op://REF …]   drop cached secrets: all, or those of a file/ref
+  op-direnv flush  --token               …and the SA token too, so the next call asks Touch ID
+  op-direnv cache-init [--hours N]       create a dedicated cache keychain that auto-locks
 
-_hash() {  # stable hash of stdin; macOS `md5`, Linux `md5sum`
-  if command -v md5 >/dev/null 2>&1; then md5 -q /dev/stdin
-  else md5sum | cut -d' ' -f1; fi
-}
+REF is an op:// reference to a 1Password item holding a Service Account token, stored
+in a vault you can unlock interactively (e.g. Private). The token is read with biometric
+(op desktop integration), cached in $TMPDIR, reused without prompts.
 
-_cache_path() {  # same scheme as the legacy direnvrc (echo adds a newline) → shared cache
-  printf '%s/.op-sa-%s' "${TMPDIR:-/tmp}" "$(printf '%s\n' "$1" | _hash)"
-}
+Secret VALUES are cached in the login Keychain, one entry per op:// reference, so the
+same reference is shared across projects. There is no TTL by design: `flush` is both the
+cache reset and the garbage collection — run it after rotating a secret in 1Password.
+OP_DIRENV_NO_CACHE=1 bypasses the cache for a single call.
 
-_ensure_token() {  # echo the SA token for REF, reading+caching on first use
-  local ref="$1" cache
-  cache="$(_cache_path "$ref")"
-  if [[ ! -s "$cache" ]]; then
-    # env -u: read WITHOUT an active SA token — the token item lives in a
-    # biometric vault a service account cannot read.
-    ( umask 077; env -u OP_SERVICE_ACCOUNT_TOKEN op read "$ref" >"$cache" ) \
-      || { rm -f "$cache"; echo "op-direnv: cannot read SA token: $ref" >&2; return 1; }
-  fi
-  cat "$cache"
-}
+By default the cache lives in the login keychain. `cache-init` moves it to a dedicated
+keychain that auto-locks after N hours; its password is stored in 1Password, so unlocking
+costs an `op read` from a biometric vault — that is, Touch ID on 1Password's own schedule.
 
-cmd="${1:-}"; shift || true
-case "$cmd" in
-  auth)
-    ref="${1:-$DEFAULT_SA}"
-    printf 'export OP_SERVICE_ACCOUNT_TOKEN=%q\n' "$(_ensure_token "$ref")"
-    ;;
+Default SA: $OP_DIRENV_DEFAULT_SA, else the constant below.
+"""
+from __future__ import annotations   # `str | None` in annotations works on python 3.9 too
+                                    # (launchd agents get /usr/bin/python3, which is 3.9)
 
-  inject)
-    file="" sa=""
-    while [[ $# -gt 0 ]]; do
-      case "$1" in
-        --sa) sa="${2:?--sa needs a REF}"; shift 2 ;;
-        *)    file="$1"; shift ;;
-      esac
-    done
-    [[ -n "$file" ]] || { echo "usage: op-direnv inject FILE [--sa REF]" >&2; exit 2; }
-    if [[ -n "$sa" ]]; then
-      OP_SERVICE_ACCOUNT_TOKEN="$(_ensure_token "$sa")" op inject --in-file "$file"
-    elif [[ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]]; then
-      op inject --in-file "$file"
-    else
-      OP_SERVICE_ACCOUNT_TOKEN="$(_ensure_token "$DEFAULT_SA")" op inject --in-file "$file"
-    fi
-    ;;
+import base64
+import hashlib
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
-  render)
-    src="" dest="" sa=""
-    while [[ $# -gt 0 ]]; do
-      case "$1" in
-        --sa) sa="${2:?--sa needs a REF}"; shift 2 ;;
-        *)    if [[ -z "$src" ]]; then src="$1"; else dest="$1"; fi; shift ;;
-      esac
-    done
-    [[ -n "$src" && -n "$dest" ]] || { echo "usage: op-direnv render SRC DEST [--sa REF]" >&2; exit 2; }
-    ( umask 077
-      OP_SERVICE_ACCOUNT_TOKEN="$(_ensure_token "${sa:-$DEFAULT_SA}")" op inject --in-file "$src" >"$dest" )
-    ;;
+DEFAULT_SA = os.environ.get(
+    "OP_DIRENV_DEFAULT_SA", "op://Private/1pass-service-accounts/src-envs-shell")
+ACCOUNT = os.environ.get("USER", "unknown")
+NO_CACHE = bool(os.environ.get("OP_DIRENV_NO_CACHE"))
+CACHE_MAX = 3800   # `security -i` truncates input lines past ~4 KB; skip caching beyond that
+TMPDIR = Path(os.environ.get("TMPDIR", "/tmp"))
 
-  exec)
-    ref="${1:?usage: op-direnv exec REF -- CMD...}"; shift
-    [[ "${1:-}" == "--" ]] && shift
-    [[ $# -gt 0 ]] || { echo "usage: op-direnv exec REF -- CMD..." >&2; exit 2; }
-    OP_SERVICE_ACCOUNT_TOKEN="$(_ensure_token "$ref")" exec "$@"
-    ;;
+# Dedicated cache keychain (optional): created by `cache-init`, absent → login keychain
+CACHE_KEYCHAIN = Path(os.environ.get(
+    "OP_DIRENV_KEYCHAIN", Path.home() / "Library/Keychains/op-direnv.keychain-db"))
+KEYCHAIN_PW_REF = os.environ.get(
+    "OP_DIRENV_KEYCHAIN_PW", "op://Private/op-direnv-keychain/password")
+KEYCHAIN_TITLE = "op-direnv-keychain"
 
-  ""|-h|--help|help)
-    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
-    ;;
 
-  *) echo "op-direnv: unknown command '$cmd' (try: auth, inject, render, exec)" >&2; exit 2 ;;
-esac
+def die(msg: str, code: int = 2):
+    print(f"op-direnv: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ── Service Account token (biometric once, then cached in $TMPDIR) ───────────
+
+def _token_path(ref: str) -> Path:
+    # same hash scheme as the shell version (`printf '%s\n'` adds the newline)
+    return TMPDIR / f".op-sa-{hashlib.md5((ref + chr(10)).encode()).hexdigest()}"
+
+
+def ensure_token(ref: str) -> str:
+    path = _token_path(ref)
+    if not (path.exists() and path.stat().st_size):
+        # read WITHOUT an active SA token: the token item lives in a biometric
+        # vault a service account cannot read
+        env = {k: v for k, v in os.environ.items() if k != "OP_SERVICE_ACCOUNT_TOKEN"}
+        got = subprocess.run(["op", "read", ref], capture_output=True, text=True, env=env)
+        if got.returncode:
+            die(f"cannot read SA token: {ref}\n{got.stderr.strip()}", 1)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(got.stdout)
+    return path.read_text().rstrip("\n")
+
+
+def op_inject(sa: str | None, path: Path) -> str:
+    """Resolve a file through `op inject`; the token is read only when needed."""
+    env = dict(os.environ)
+    if sa or not env.get("OP_SERVICE_ACCOUNT_TOKEN"):
+        env["OP_SERVICE_ACCOUNT_TOKEN"] = ensure_token(sa or DEFAULT_SA)
+    got = subprocess.run(["op", "inject", "--in-file", str(path)],
+                         capture_output=True, text=True, env=env)
+    if got.returncode:
+        sys.stderr.write(got.stderr)
+        sys.exit(got.returncode)
+    return got.stdout
+
+
+# ── secret cache: login Keychain, one entry per op:// reference ──────────────
+# Entry name is `op-direnv:<op:// reference>:<SA hash>` — readable in Keychain Access
+# and greppable via `op-direnv cache`. Same reference in two projects → one entry.
+
+# A reference ends at the next quote or at end of line — NOT at a space:
+# `op://Vault/gh tokens/field` is one valid reference.
+REF_RE = re.compile(r"""op://[^"']*""")
+
+
+def refs_of(*paths) -> list[str]:
+    found = set()
+    for path in paths:
+        if not Path(path).is_file():
+            die(f"no such file: {path}")
+        for line in Path(path).read_text().splitlines():
+            found.update(m.group() for m in REF_RE.finditer(line) if len(m.group()) > 5)
+    return sorted(found)
+
+
+def sa_sig(ref: str) -> str:
+    return hashlib.md5(ref.encode()).hexdigest()[:8]
+
+
+def entry_name(ref: str, sa8: str) -> str:
+    return f"op-direnv:{ref}:{sa8}"
+
+
+def _kc_target() -> list:
+    """The dedicated keychain if it exists, else nothing → default (login) keychain."""
+    return [str(CACHE_KEYCHAIN)] if CACHE_KEYCHAIN.exists() else []
+
+
+def _kc_unlocked() -> bool:
+    """Is the cache keychain unlocked? Asked via Security.framework, which — unlike
+    `security show-keychain-info` — answers without popping a password dialog."""
+    import ctypes
+    from ctypes import byref, c_uint32, c_void_p
+    sec = ctypes.CDLL("/System/Library/Frameworks/Security.framework/Security")
+    ref = c_void_p()
+    if sec.SecKeychainOpen(str(CACHE_KEYCHAIN).encode(), byref(ref)):
+        return False
+    state = c_uint32()
+    if sec.SecKeychainGetStatus(ref, byref(state)):
+        return False
+    return bool(state.value & 1)      # kSecUnlockStateStatus
+
+
+def ensure_unlocked() -> bool:
+    """Unlock the cache keychain if it locked itself, taking the password from 1Password.
+
+    Must run BEFORE touching the keychain: a locked keychain answers a read with a modal
+    dialog that outlives both `timeout` and the process that triggered it.
+    """
+    if not CACHE_KEYCHAIN.exists() or _kc_unlocked():
+        return True
+    got = subprocess.run(["op", "read", KEYCHAIN_PW_REF], capture_output=True, text=True,
+                         env={k: v for k, v in os.environ.items()
+                              if k != "OP_SERVICE_ACCOUNT_TOKEN"})
+    if got.returncode:
+        print(f"op-direnv: cannot unlock cache keychain: {got.stderr.strip()}", file=sys.stderr)
+        return False
+    subprocess.run(["security", "-i"], text=True, capture_output=True,
+                   input=f"unlock-keychain -p {shlex.quote(got.stdout.strip())} {CACHE_KEYCHAIN}\n")
+    return _kc_unlocked()
+
+
+def kc_get(name: str) -> str | None:
+    if NO_CACHE:
+        return None
+    got = subprocess.run(["security", "find-generic-password", "-a", ACCOUNT, "-s", name, "-w"]
+                         + _kc_target(), capture_output=True, text=True)
+    if got.returncode:
+        return None
+    try:
+        return base64.b64decode(got.stdout.strip()).decode()
+    except Exception:
+        return None
+
+
+def kc_put(name: str, value: str) -> None:
+    if NO_CACHE:
+        return
+    blob = base64.b64encode(value.encode()).decode()
+    if len(blob) > CACHE_MAX:
+        return                       # too large for the batch parser — resolved every time
+    # batch mode (-i): the value never reaches argv, so `ps` cannot see it
+    target = f" {shlex.quote(str(CACHE_KEYCHAIN))}" if _kc_target() else ""
+    subprocess.run(["security", "-i"], text=True, capture_output=True,
+                   input=f"add-generic-password -U -a {ACCOUNT} -s {shlex.quote(name)} -w {blob}{target}\n")
+
+
+def kc_delete(name: str) -> bool:
+    return subprocess.run(["security", "delete-generic-password", "-s", name] + _kc_target(),
+                          capture_output=True).returncode == 0
+
+
+def kc_list() -> list[tuple[str, str]]:
+    """[(entry, created UTC)] — attributes come alphabetically, so cdat precedes svce."""
+    dump = subprocess.run(["security", "dump-keychain"] + _kc_target(),
+                          capture_output=True, text=True).stdout
+    found, cdat = [], None
+    for line in dump.splitlines():
+        line = line.strip()
+        if line.startswith('"cdat"'):
+            cdat = line.split('"')[-2].rstrip("\\000")
+        elif line.startswith('"svce"') and '="op-direnv:' in line and cdat:
+            found.append((line.split('="', 1)[1].rstrip('"'), cdat))
+            cdat = None
+    return found
+
+
+def fetch(sa: str | None, refs: list[str]) -> dict[str, str]:
+    """Resolve every reference in ONE `op` call — the network cost is per call, not per ref."""
+    marker = f"#__op-direnv-val-{os.getpid()}__"
+    with tempfile.TemporaryDirectory(dir=TMPDIR) as tmp:
+        src = Path(tmp) / "refs"
+        src.write_text("".join(f"{ref}\n{marker}\n" for ref in refs))
+        out = op_inject(sa, src)
+    values = out.split(f"\n{marker}\n")[:-1]       # trailing marker leaves an empty tail
+    return dict(zip(refs, values))
+
+
+def load(sa: str | None, paths: list) -> dict[str, str]:
+    """{ref: value} for every reference in paths; misses are fetched in a single call."""
+    ensure_unlocked()
+    sa8 = sa_sig(sa or DEFAULT_SA)
+    refs = refs_of(*paths)
+    with ThreadPoolExecutor(max_workers=8) as pool:   # ~20 ms each, so read them at once
+        values = dict(zip(refs, pool.map(lambda r: kc_get(entry_name(r, sa8)), refs)))
+    missing = [ref for ref, val in values.items() if val is None]
+    if missing:
+        for ref, val in fetch(sa, missing).items():
+            kc_put(entry_name(ref, sa8), val)
+            values[ref] = val
+    return values
+
+
+def render(path, values: dict[str, str], sa: str | None) -> str:
+    """Substitute cached values; fall back to `op inject` whenever the cache can't serve."""
+    text = Path(path).read_text()
+    for ref in refs_of(path):
+        val = values.get(ref)
+        if val is None:
+            return op_inject(sa, Path(path))
+        text = text.replace(ref, val)
+    if "op://" in text:                            # our parser missed a reference
+        return op_inject(sa, Path(path))
+    return text
+
+
+def write_private(path, text: str) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+
+
+# ── commands ────────────────────────────────────────────────────────────────
+
+def split_sa(args: list[str]) -> tuple[str | None, list[str]]:
+    sa, rest, i = None, [], 0
+    while i < len(args):
+        if args[i] == "--sa":
+            if i + 1 >= len(args):
+                die("--sa needs a REF")
+            sa, i = args[i + 1], i + 2
+        else:
+            rest.append(args[i])
+            i += 1
+    return sa, rest
+
+
+def cmd_auth(args):
+    ref = args[0] if args else DEFAULT_SA
+    print(f"export OP_SERVICE_ACCOUNT_TOKEN={shlex.quote(ensure_token(ref))}")
+
+
+def cmd_inject(args):
+    sa, rest = split_sa(args)
+    if len(rest) != 1:
+        die("usage: op-direnv inject FILE [--sa REF]")
+    sys.stdout.write(render(rest[0], load(sa, rest), sa))
+
+
+def cmd_render(args):
+    sa, rest = split_sa(args)
+    if len(rest) != 2:
+        die("usage: op-direnv render SRC DEST [--sa REF]")
+    src, dest = rest
+    write_private(dest, render(src, load(sa, [src]), sa))
+
+
+def cmd_multi(args):
+    """Several files, one op call: gather every reference first, then render each file."""
+    sa, envfile, files, i = None, None, [], 0
+    while i < len(args):
+        if args[i] == "--sa":
+            sa, i = args[i + 1], i + 2
+        elif args[i] == "--file":
+            if i + 3 >= len(args):
+                die("--file needs SRC VAR DEST")
+            files.append(tuple(args[i + 1:i + 4]))
+            i += 4
+        else:
+            envfile, i = args[i], i + 1
+    if not envfile and not files:
+        die("usage: op-direnv multi [ENVFILE] [--file SRC VAR DEST]... [--sa REF]")
+
+    sources = ([envfile] if envfile else []) + [src for src, _, _ in files]
+    values = load(sa, sources)
+    if envfile:
+        sys.stdout.write(render(envfile, values, sa))
+    for src, var, dest in files:
+        write_private(dest, render(src, values, sa))
+        print(f"export {var}={shlex.quote(dest)}")
+
+
+def cmd_exec(args):
+    if not args:
+        die("usage: op-direnv exec REF -- CMD...")
+    ref, rest = args[0], args[1:]
+    if rest and rest[0] == "--":
+        rest = rest[1:]
+    if not rest:
+        die("usage: op-direnv exec REF -- CMD...")
+    os.execvpe(rest[0], rest, {**os.environ, "OP_SERVICE_ACCOUNT_TOKEN": ensure_token(ref)})
+
+
+def cmd_cache_init(args):
+    """Move the cache into its own auto-locking keychain, password kept in 1Password."""
+    hours = 4.0
+    if "--hours" in args:
+        hours = float(args[args.index("--hours") + 1])
+    if CACHE_KEYCHAIN.exists():
+        die(f"already exists: {CACHE_KEYCHAIN}\nremove it with: security delete-keychain {CACHE_KEYCHAIN}")
+
+    stale = [name for name, _ in kc_list()]        # entries still sitting in the login keychain
+    print(f"1Password: creating item {KEYCHAIN_TITLE!r} in Private (may ask Touch ID)")
+    env = {k: v for k, v in os.environ.items() if k != "OP_SERVICE_ACCOUNT_TOKEN"}
+    made = subprocess.run(
+        ["op", "item", "create", "--category", "password", "--title", KEYCHAIN_TITLE,
+         "--vault", "Private", "--generate-password=letters,digits,32"],
+        capture_output=True, text=True, env=env)      # generated by op: never passes through argv
+    if made.returncode:
+        die(f"cannot create the 1Password item:\n{made.stderr.strip()}", 1)
+
+    got = subprocess.run(["op", "read", KEYCHAIN_PW_REF], capture_output=True, text=True, env=env)
+    if got.returncode:
+        die(f"item created but not readable at {KEYCHAIN_PW_REF}\n{got.stderr.strip()}", 1)
+    password = got.stdout.strip()
+
+    subprocess.run(["security", "-i"], text=True, capture_output=True,
+                   input=f"create-keychain -p {shlex.quote(password)} {CACHE_KEYCHAIN}\n")
+    if not CACHE_KEYCHAIN.exists():
+        die("could not create the keychain", 1)
+    subprocess.run(["security", "set-keychain-settings", "-t", str(int(hours * 3600)),
+                    str(CACHE_KEYCHAIN)])
+
+    for name in stale:                              # tidy up what the login keychain still holds
+        subprocess.run(["security", "delete-generic-password", "-s", name], capture_output=True)
+    print(f"created {CACHE_KEYCHAIN}")
+    print(f"  auto-locks after {hours} h idle; unlocking reads {KEYCHAIN_PW_REF}")
+    print(f"  moved out of the login keychain: {len(stale)} stale entries removed")
+
+
+def cmd_cache(args):
+    if CACHE_KEYCHAIN.exists():
+        state = "unlocked" if _kc_unlocked() else "locked (next use asks 1Password)"
+        info = subprocess.run(["security", "show-keychain-info", str(CACHE_KEYCHAIN)],
+                              capture_output=True, text=True) if _kc_unlocked() else None
+        extra = f" — {info.stderr.strip() or info.stdout.strip()}" if info else ""
+        print(f"keychain: {CACHE_KEYCHAIN.name}, {state}{extra}")
+    else:
+        print("keychain: login (default) — run `op-direnv cache-init` for a dedicated one")
+    for name, cdat in kc_list():
+        when = f"{cdat[0:4]}-{cdat[4:6]}-{cdat[6:8]} {cdat[8:10]}:{cdat[10:12]} UTC"
+        print(f"{when}  {name[len('op-direnv:'):]}")
+
+
+def cmd_flush(args):
+    ensure_unlocked()
+    # --token also drops the cached SA token: Touch ID happens only when the token is
+    # re-read, so without this the next call just uses the live token and asks nothing.
+    drop_token = "--token" in args
+    args = [a for a in args if a != "--token"]
+    if drop_token:
+        for stale in TMPDIR.glob(".op-sa-*"):
+            stale.unlink(missing_ok=True)
+            print(f"flushed: SA token {stale.name}")
+
+    wanted = []
+    for arg in args:
+        if arg.startswith("op://"):
+            wanted.append(arg)
+        elif Path(arg).is_file():
+            wanted += refs_of(arg)
+        else:
+            die(f"not a file or op:// ref: {arg}")
+
+    targets = [name for name, _ in kc_list()
+               if not args or any(name.startswith(f"op-direnv:{ref}:") for ref in wanted)]
+    for name in targets:
+        if kc_delete(name):
+            print(f"flushed: {name[len('op-direnv:'):]}")
+    if not targets and not drop_token:
+        print("op-direnv: nothing to flush", file=sys.stderr)
+
+
+COMMANDS = {"auth": cmd_auth, "inject": cmd_inject, "render": cmd_render,
+            "multi": cmd_multi, "exec": cmd_exec, "cache": cmd_cache,
+            "cache-init": cmd_cache_init, "flush": cmd_flush}
+
+if __name__ == "__main__":
+    name = sys.argv[1] if len(sys.argv) > 1 else ""
+    if name in ("", "-h", "--help", "help"):
+        print(__doc__.strip())
+    elif name in COMMANDS:
+        COMMANDS[name](sys.argv[2:])
+    else:
+        die(f"unknown command '{name}' (try: {', '.join(COMMANDS)})")

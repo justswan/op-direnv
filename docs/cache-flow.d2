@@ -1,0 +1,118 @@
+direction: down
+
+title: |md
+  # op-direnv: путь секрета от `cd` до окружения
+  Кэш — на уровне отдельной `op://`-ссылки, а не файла
+| {near: top-center}
+
+cd: {
+  label: "cd в проект"
+  shape: oval
+  style.fill: "#e8eef7"
+}
+
+direnv: {
+  label: "direnv читает .envrc\nop_inject .env.op"
+  style.fill: "#f2f2f2"
+}
+
+parse: {
+  label: |md
+    **_refs_of** — вынуть ссылки
+    граница ссылки — кавычка
+    или конец строки, НЕ пробел
+  |
+  style.fill: "#fff8e1"
+}
+
+unlock: {
+  label: |md
+    **ensure_unlocked**
+    статус — у Security.framework,
+    не у `security` (тот покажет окно)
+    заперт → пароль из 1Password → Touch ID
+  |
+  style.fill: "#fff8e1"
+}
+
+lookup: {
+  label: "по каждой ссылке —\nчтение из Keychain\n(параллельно)"
+  shape: diamond
+  style.fill: "#fff8e1"
+}
+
+keychain: {
+  label: |md
+    **op-direnv.keychain**
+    `op-direnv:op://Vault/item/field:<SA>`
+    одна запись на ссылку,
+    автолок через 12 ч бездействия
+  |
+  shape: cylinder
+  style.fill: "#e6f4ea"
+}
+
+hit: {
+  label: "все ссылки найдены"
+  style.fill: "#e6f4ea"
+  style.stroke: "#34a853"
+
+  subst: {
+    label: "подстановка значений\nв текст файла"
+    style.fill: "#ffffff"
+  }
+  check: {
+    label: "остался ли op:// ?\nда → честный op inject"
+    style.fill: "#ffffff"
+  }
+  subst -> check
+}
+
+miss: {
+  label: "есть промахи"
+  style.fill: "#fce8e6"
+  style.stroke: "#ea4335"
+
+  batch: {
+    label: "ВСЕ промахи — одним op inject\n(ссылки через маркер-разделитель)\n~750 мс независимо от их числа"
+    style.fill: "#ffffff"
+  }
+  store: {
+    label: "_kc_put каждое значение\nsecurity -i (batch), мимо argv\n> 3800 байт — не кэшируем"
+    style.fill: "#ffffff"
+  }
+  batch -> store
+}
+
+out: {
+  label: "export-строки → окружение\nkubeconfig → файл на диске"
+  shape: oval
+  style.fill: "#e8eef7"
+}
+
+flush: {
+  label: |md
+    **op-direnv flush [файл или op://ref]**
+    сброс кэша = уборка мусора
+    TTL нет — после ротации
+    секрета вызывать руками
+  |
+  style.fill: "#f2f2f2"
+  style.stroke-dash: 3
+}
+
+login: {
+  label: "launchd RunAtLoad → flush\nпри входе в систему:\nпосле ребута снова Touch ID"
+  style.fill: "#f2f2f2"
+  style.stroke-dash: 3
+}
+
+cd -> direnv -> parse -> unlock -> lookup
+lookup -> hit.subst: "попадание ~0.1 с" {style.stroke: "#34a853"}
+lookup -> miss.batch: "промах" {style.stroke: "#ea4335"}
+keychain -> lookup: "читает"
+miss.store -> keychain: "пишет"
+miss.store -> hit.subst: "теперь всё в кэше"
+hit.check -> out
+flush -> keychain: "удаляет" {style.stroke-dash: 3}
+login -> flush: {style.stroke-dash: 3}

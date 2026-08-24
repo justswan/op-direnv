@@ -5,6 +5,7 @@
 #   op_auth  [ref]                       — set OP_SERVICE_ACCOUNT_TOKEN (ambient, biometric once)
 #   op_inject src [--sa ref]             — eval secrets from a file (optionally under another SA)
 #   op_inject src VAR dest [--sa ref]    — write resolved file to dest, export VAR=dest
+#   op_multi  src [--file src VAR dest]… — same, but one `op` call for all of them
 #
 # Setup:
 #   cp direnvrc ~/.config/direnv/direnvrc   # plus: install `op-direnv` on PATH
@@ -34,4 +35,18 @@ op_inject() {
   fi
 
   command -v watch_file &>/dev/null && watch_file "$src"
+}
+
+# One `op` call instead of one per file — saves a full TLS round-trip each.
+#   op_multi .env.op --file .kube/config KUBECONFIG "$TMPDIR/kubeconfig-foo"
+op_multi() {
+  eval "$(op-direnv multi "$@")"
+  command -v watch_file &>/dev/null || return 0
+  while [[ $# -gt 0 ]]; do                    # watch sources only — never the dest (rewritten every load)
+    case "$1" in
+      --sa)   shift 2 ;;
+      --file) watch_file "$2"; shift 4 ;;
+      *)      watch_file "$1"; shift ;;
+    esac
+  done
 }
