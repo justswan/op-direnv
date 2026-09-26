@@ -24,9 +24,9 @@ flowchart TD
     pw --> refs["собрать op://-ссылки<br/>из .env.op и .kube/config"]
     refs --> hit{"каждая ссылка<br/>есть в кэше?"}
     hit -- "все есть" --> subst["подстановка значений<br/>~0.1 с, сети нет"]
-    hit -- "есть промахи" --> tok{"SA-токен<br/>в $TMPDIR?"}
+    hit -- "есть промахи" --> tok{"SA-токен<br/>в кэше?"}
     tok -- "нет" --> tA["op read → Touch ID<br/>(env -u, биометрия)"]
-    tA --> cA["кэш токена $TMPDIR/.op-sa-*"]
+    tA --> cA["кэш токена: keychain кэша<br/>(без cache-init — $TMPDIR/.op-sa-*)"]
     tok -- "да" --> cA
     cA --> inj["ВСЕ промахи одним op inject<br/>~0.7 с независимо от их числа"]
     inj --> put["каждое значение → keychain<br/>(security -i, мимо argv)"]
@@ -36,7 +36,7 @@ flowchart TD
 
 1. Первый `cd` в проект → direnv вызывает `op_inject` → нужен SA token
 2. `op_auth` делает `op read` через личный аккаунт → **Touch ID один раз**
-3. SA token сохраняется в `$TMPDIR/.op-sa-*`
+3. SA token сохраняется в выделенный keychain кэша (`cache-init`) и запирается вместе с ним; без выделенного keychain — в `$TMPDIR/.op-sa-*`
 4. Все последующие `op inject` (в любом терминале) используют кэшированный SA token
 5. После ребута — снова один Touch ID
 
@@ -260,13 +260,13 @@ keychain заперт         → op read пароля из Private → 1Passwor
 
 ### Будильник: когда снова спросит Touch ID
 
-Биометрия случается **только** при чтении SA-токена. Токен живёт в `$TMPDIR` до перезагрузки, поэтому обычный `flush` пальчик не вернёт: кэш опустеет и молча наполнится снова из живого токена. Нужен `--token`:
+Биометрия случается **только** при чтении SA-токена (и пароля keychain после автолока). Токен живёт в кэше до автолока keychain — или, без `cache-init`, в `$TMPDIR` до перезагрузки, поэтому обычный `flush` пальчик не вернёт: кэш опустеет и молча наполнится снова из живого токена. Нужен `--token`:
 
 ```bash
 op-direnv flush --token    # кэш + SA-токен → следующий `cd` спросит Touch ID
 ```
 
-Если включён автолок (`cache-init`), это уже не главный механизм — кэш и так запирается сам. Но токен `--token` стережёт отдельно: готовый launchd-агент чистит его **ежедневно в 04:00 и при каждом входе в систему**:
+Если включён автолок (`cache-init`), это уже не главный механизм — токен лежит в том же keychain и запирается вместе с кэшем. `flush --token` на запертом keychain ничего не отпирает (иначе агент в 04:00 спрашивал бы Touch ID ночью) — токен и так недоступен. Готовый launchd-агент чистит его **ежедневно в 04:00 и при каждом входе в систему**:
 
 ```bash
 sed "s/USERNAME/$USER/g" launchd/local.op-direnv.flush.plist > ~/Library/LaunchAgents/local.op-direnv.flush.plist
@@ -376,7 +376,7 @@ alias op2='op-direnv exec op://Private/1pass-service-accounts/other-account -- o
 
 ### `op_auth [ref]` (обёртка над `op-direnv auth`)
 
-Получает SA token через `op read` (биометрия), кэширует в `$TMPDIR/.op-sa-*`, выставляет ambient `OP_SERVICE_ACCOUNT_TOKEN`. При повторном вызове — из кэша.
+Получает SA token через `op read` (биометрия), кэширует в keychain кэша как `op-direnv-sa:<REF>` (без `cache-init` — в `$TMPDIR/.op-sa-*`; старый файл при первом вызове переносится в keychain и удаляется), выставляет ambient `OP_SERVICE_ACCOUNT_TOKEN`. При повторном вызове — из кэша.
 
 ### `op_inject src [--sa ref]` (обёртка над `op-direnv inject`/`render`)
 

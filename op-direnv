@@ -13,7 +13,8 @@
 
 REF is an op:// reference to a 1Password item holding a Service Account token, stored
 in a vault you can unlock interactively (e.g. Private). The token is read with biometric
-(op desktop integration), cached in $TMPDIR, reused without prompts.
+(op desktop integration) and reused without prompts: from the dedicated cache keychain
+when `cache-init` has made one (so it locks together with the cache), else from $TMPDIR.
 
 Secret VALUES are cached in the login Keychain, one entry per op:// reference, so the
 same reference is shared across projects. There is no TTL by design: `flush` is both the
@@ -60,7 +61,13 @@ def die(msg: str, code: int = 2):
     sys.exit(code)
 
 
-# ── Service Account token (biometric once, then cached in $TMPDIR) ───────────
+# ── Service Account token (biometric once, then cached) ─────────────────────
+# With a dedicated cache keychain the token lives there as `op-direnv-sa:<REF>` and locks
+# together with the cached values. Without one it stays a 0600 file in $TMPDIR, as before:
+# the login keychain would never lock and would keep the token across reboots.
+
+TOKEN_PREFIX = "op-direnv-sa:"
+
 
 def _token_path(ref: str) -> Path:
     # same hash scheme as the shell version (`printf '%s\n'` adds the newline)
@@ -69,17 +76,32 @@ def _token_path(ref: str) -> Path:
 
 def ensure_token(ref: str) -> str:
     path = _token_path(ref)
-    if not (path.exists() and path.stat().st_size):
-        # read WITHOUT an active SA token: the token item lives in a biometric
-        # vault a service account cannot read
-        env = {k: v for k, v in os.environ.items() if k != "OP_SERVICE_ACCOUNT_TOKEN"}
-        got = subprocess.run(["op", "read", ref], capture_output=True, text=True, env=env)
-        if got.returncode:
-            die(f"cannot read SA token: {ref}\n{got.stderr.strip()}", 1)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(got.stdout)
-    return path.read_text().rstrip("\n")
+    in_kc = CACHE_KEYCHAIN.exists() and ensure_unlocked()
+    if in_kc:
+        token = _kc_read(TOKEN_PREFIX + ref)
+        if token:
+            return token
+        if path.exists() and path.stat().st_size:     # migrate a token cached before
+            token = path.read_text().rstrip("\n")
+            _kc_write(TOKEN_PREFIX + ref, token)
+            path.unlink(missing_ok=True)
+            return token
+    elif path.exists() and path.stat().st_size:
+        return path.read_text().rstrip("\n")
+
+    # read WITHOUT an active SA token: the token item lives in a biometric
+    # vault a service account cannot read
+    env = {k: v for k, v in os.environ.items() if k != "OP_SERVICE_ACCOUNT_TOKEN"}
+    got = subprocess.run(["op", "read", ref], capture_output=True, text=True, env=env)
+    if got.returncode:
+        die(f"cannot read SA token: {ref}\n{got.stderr.strip()}", 1)
+    token = got.stdout.rstrip("\n")
+    if in_kc:
+        if not _kc_write(TOKEN_PREFIX + ref, token):
+            print("op-direnv: SA token too large for the keychain, not cached", file=sys.stderr)
+    elif not CACHE_KEYCHAIN.exists():               # locked and unopenable → don't cache at all
+        write_private(path, token + "\n")
+    return token
 
 
 def op_inject(sa: str | None, path: Path) -> str:
@@ -161,9 +183,7 @@ def ensure_unlocked() -> bool:
     return _kc_unlocked()
 
 
-def kc_get(name: str) -> str | None:
-    if NO_CACHE:
-        return None
+def _kc_read(name: str) -> str | None:
     got = subprocess.run(["security", "find-generic-password", "-a", ACCOUNT, "-s", name, "-w"]
                          + _kc_target(), capture_output=True, text=True)
     if got.returncode:
@@ -174,16 +194,24 @@ def kc_get(name: str) -> str | None:
         return None
 
 
-def kc_put(name: str, value: str) -> None:
-    if NO_CACHE:
-        return
+def _kc_write(name: str, value: str) -> bool:
     blob = base64.b64encode(value.encode()).decode()
     if len(blob) > CACHE_MAX:
-        return                       # too large for the batch parser — resolved every time
+        return False                 # too large for the batch parser — resolved every time
     # batch mode (-i): the value never reaches argv, so `ps` cannot see it
     target = f" {shlex.quote(str(CACHE_KEYCHAIN))}" if _kc_target() else ""
     subprocess.run(["security", "-i"], text=True, capture_output=True,
                    input=f"add-generic-password -U -a {ACCOUNT} -s {shlex.quote(name)} -w {blob}{target}\n")
+    return True
+
+
+def kc_get(name: str) -> str | None:
+    return None if NO_CACHE else _kc_read(name)
+
+
+def kc_put(name: str, value: str) -> None:
+    if not NO_CACHE:
+        _kc_write(name, value)
 
 
 def kc_delete(name: str) -> bool:
@@ -191,7 +219,7 @@ def kc_delete(name: str) -> bool:
                           capture_output=True).returncode == 0
 
 
-def kc_list() -> list[tuple[str, str]]:
+def kc_list(prefix: str = "op-direnv:") -> list[tuple[str, str]]:
     """[(entry, created UTC)] — attributes come alphabetically, so cdat precedes svce."""
     dump = subprocess.run(["security", "dump-keychain"] + _kc_target(),
                           capture_output=True, text=True).stdout
@@ -200,7 +228,7 @@ def kc_list() -> list[tuple[str, str]]:
         line = line.strip()
         if line.startswith('"cdat"'):
             cdat = line.split('"')[-2].rstrip("\\000")
-        elif line.startswith('"svce"') and '="op-direnv:' in line and cdat:
+        elif line.startswith('"svce"') and f'="{prefix}' in line and cdat:
             found.append((line.split('="', 1)[1].rstrip('"'), cdat))
             cdat = None
     return found
@@ -368,13 +396,16 @@ def cmd_cache(args):
         print(f"keychain: {CACHE_KEYCHAIN.name}, {state}{extra}")
     else:
         print("keychain: login (default) — run `op-direnv cache-init` for a dedicated one")
-    for name, cdat in kc_list():
+    if CACHE_KEYCHAIN.exists() and not _kc_unlocked():
+        return                                     # a locked keychain may answer a dump with a dialog
+    for name, cdat in kc_list(TOKEN_PREFIX) + kc_list():
         when = f"{cdat[0:4]}-{cdat[4:6]}-{cdat[6:8]} {cdat[8:10]}:{cdat[10:12]} UTC"
-        print(f"{when}  {name[len('op-direnv:'):]}")
+        label = f"SA token {name[len(TOKEN_PREFIX):]}" if name.startswith(TOKEN_PREFIX) \
+            else name[len('op-direnv:'):]
+        print(f"{when}  {label}")
 
 
 def cmd_flush(args):
-    ensure_unlocked()
     # --token also drops the cached SA token: Touch ID happens only when the token is
     # re-read, so without this the next call just uses the live token and asks nothing.
     drop_token = "--token" in args
@@ -383,6 +414,17 @@ def cmd_flush(args):
         for stale in TMPDIR.glob(".op-sa-*"):
             stale.unlink(missing_ok=True)
             print(f"flushed: SA token {stale.name}")
+        if not args and CACHE_KEYCHAIN.exists() and not _kc_unlocked():
+            # the launchd agent lands here at 04:00: a locked keychain already guards the
+            # token, and unlocking it just to delete would ask for Touch ID in the night
+            print("keychain locked: SA token already needs Touch ID")
+            return
+        ensure_unlocked()
+        for name, _ in kc_list(TOKEN_PREFIX):
+            if kc_delete(name):
+                print(f"flushed: SA token {name[len(TOKEN_PREFIX):]}")
+    else:
+        ensure_unlocked()
 
     wanted = []
     for arg in args:
