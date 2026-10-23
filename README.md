@@ -269,8 +269,8 @@ op-direnv flush --token    # кэш + SA-токен → следующий `cd` 
 Если включён автолок (`cache-init`), это уже не главный механизм — кэш и так запирается сам. Но токен `--token` стережёт отдельно: готовый launchd-агент чистит его **ежедневно в 04:00 и при каждом входе в систему**:
 
 ```bash
-sed "s/USERNAME/$USER/g" launchd/local.op-direnv.flush.plist > ~/Library/LaunchAgents/local.op-direnv.flush.plist
-launchctl load ~/Library/LaunchAgents/local.op-direnv.flush.plist
+sed "s/USERNAME/$USER/g" launchd/org.justswan.op-direnv.flush.plist > ~/Library/LaunchAgents/org.justswan.op-direnv.flush.plist
+launchctl load ~/Library/LaunchAgents/org.justswan.op-direnv.flush.plist
 ```
 
 Проверить: `launchctl list | grep op-direnv` (второе поле 0 = последний запуск успешен), лог — `~/Library/Logs/op-direnv-flush.log`. Расписание правится в plist (`StartCalendarInterval`), снять — `launchctl unload`.

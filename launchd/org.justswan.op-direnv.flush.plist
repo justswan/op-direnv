@@ -4,12 +4,12 @@
      Without --token the cache would simply refill from the still-valid token, silently.
 
      Install: replace USERNAME below, then
-       cp launchd/local.op-direnv.flush.plist ~/Library/LaunchAgents/
-       launchctl load ~/Library/LaunchAgents/local.op-direnv.flush.plist -->
+       cp launchd/org.justswan.op-direnv.flush.plist ~/Library/LaunchAgents/
+       launchctl load ~/Library/LaunchAgents/org.justswan.op-direnv.flush.plist -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>local.op-direnv.flush</string>
+  <string>org.justswan.op-direnv.flush</string>
   <key>ProgramArguments</key>
   <array>
     <string>/Users/USERNAME/bin/op-direnv</string>
